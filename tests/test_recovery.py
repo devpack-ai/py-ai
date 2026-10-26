@@ -94,6 +94,46 @@ def test_small_format_helpers():
     assert A.format_setting(0.6) == "0.6"
 
 
+def test_display_model_name_pretties_llamacpp_paths():
+    """llama.cpp reports the loaded GGUF's full path as the model id, and
+    sharded repos add a "-00001-of-00005" suffix. Titles must show neither,
+    while real ids (vLLM/OpenAI) pass through untouched."""
+    assert A.display_model_name(
+        "/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf") == "Qwen2.5-7B-Instruct-Q4_K_M"
+    assert A.display_model_name(
+        "/home/tony/hf/unsloth_GLM-5.3-Flash-GGUF/UD-IQ4_XS/"
+        "GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf") == "GLM-5.3-Flash-UD-IQ4_XS"
+    assert A.display_model_name(
+        "C:\\models\\GLM-5.3-Flash-UD-IQ4_XS-00003-of-00005.gguf"
+    ) == "GLM-5.3-Flash-UD-IQ4_XS"
+    # every shard of a model displays under the same base name
+    shards = {A.display_model_name(f"/m/Big-Model-Q4-0000{i}-of-00004.gguf")
+              for i in range(1, 5)}
+    assert shards == {"Big-Model-Q4"}
+    # hosted ids are already clean
+    assert A.display_model_name("gpt-4o-mini") == "gpt-4o-mini"
+    assert A.display_model_name("qwen2.5:7b") == "qwen2.5:7b"
+    assert A.display_model_name("Qwen/Qwen3-4B") == "Qwen3-4B"
+    # degenerate ids must never render as an empty title
+    assert A.display_model_name("") == ""
+    assert A.display_model_name(".gguf") == ".gguf"
+    assert A.display_model_name("/models/dir.gguf/name.gguf") == "name"
+
+
+def test_display_model_name_never_changes_the_request_id():
+    """Display-only: the wire id, session save and /model switching all keep
+    the raw path, or llama.cpp would stop matching it."""
+    server = FakeServer()
+    try:
+        agent = make_agent(server)
+        raw = "/models/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf"
+        agent.client.model = raw
+        assert agent.client.model == raw          # payload id untouched
+        assert A.display_model_name(agent.client.model) != raw
+    finally:
+        server.stop()
+
+
 def test_cached_prompt_tokens():
     # newer llama.cpp reports the reused count directly
     assert A.cached_prompt_tokens(None, {"cache_n": 800}) == 800

@@ -185,6 +185,70 @@ def test_choose_model_picks_interactively():
         assert "--model" in str(err)
 
 
+def test_choose_model_lists_pretty_names_but_returns_the_wire_id():
+    import builtins
+
+    original = builtins.input
+    models = ["/models/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+              "/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf"]
+    try:
+        builtins.input = lambda *args: "2"
+        with recorded_console(width=140) as output:
+            assert A.choose_model(models) == models[1]   # raw id, not the title
+        text = output()
+        assert "Qwen2.5-7B-Instruct-Q4_K_M" in text
+        assert "/models/" not in text                    # paths stay out of the list
+        # typing the pretty name back resolves to the served id
+        builtins.input = lambda *args: "GLM-5.3-Flash-UD-IQ4_XS"
+        with recorded_console():
+            assert A.choose_model(models) == models[0]
+    finally:
+        builtins.input = original
+
+
+def test_resolve_model_input_maps_pretty_names_to_ids():
+    models = ["/models/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+              "/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf"]
+    assert A.resolve_model_input(models[0], models) == models[0]   # exact wins
+    assert A.resolve_model_input("GLM-5.3-Flash-UD-IQ4_XS", models) == models[0]
+    assert A.resolve_model_input("qwen2.5", models) == models[1]   # fragment
+    assert A.resolve_model_input("nope", models) is None           # unknown
+    assert A.resolve_model_input("", models) is None
+    assert A.resolve_model_input("anything", []) is None
+    # an ambiguous fragment is NOT guessed: it must stay unresolved so the
+    # caller can ask for something more specific
+    two = ["/m/A-Q4.gguf", "/m/A-Q8.gguf"]
+    assert A.resolve_model_input("A", two) is None
+    assert A.resolve_model_input("A-Q4", two) == two[0]
+
+
+def test_model_listing_pretties_and_switches_by_pretty_name():
+    server = FakeServer()
+    try:
+        server.models = ["/models/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+                         "/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf"]
+        agent = make_agent(server)
+        agent.client.model = server.models[1]   # so the listing marks it
+        with recorded_console(width=160) as output:
+            agent._handle_command("/model")
+            text = output()
+        assert "GLM-5.3-Flash-UD-IQ4_XS" in text
+        assert "/models/" not in text          # no paths in the listing
+        assert "*" in text                     # current one still marked
+        # the pretty name from that listing switches, and the wire keeps the id
+        with recorded_console(width=160):
+            agent._handle_command("/model GLM-5.3-Flash-UD-IQ4_XS")
+        assert agent.client.model == server.models[0]
+        server.push(*answer("ok"))
+        agent.conversation.append({"role": "user", "content": "hi"})
+        agent._begin_user_turn()
+        with recorded_console():
+            agent._native_turn(agent.conversation)
+        assert server.last_request["model"] == server.models[0]
+    finally:
+        server.stop()
+
+
 def test_slash_completer_matches_commands():
     if A.readline is None:                # no readline on this platform
         return

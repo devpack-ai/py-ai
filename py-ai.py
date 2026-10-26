@@ -17,6 +17,8 @@ import sys
 import shlex
 import subprocess
 import time
+from datetime import timedelta, tzinfo
+import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -59,7 +61,16 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+#-------------------------------------------------------------------------------
+# python3 py-ai.py --base-url=http://192.168.1.22:8080/v1/ --api-key=your_key --ui=textual  --report=report.txt
+
 console = Console(highlight=False)
+
+MEMORIES_DIR    = ".agent_memories"
+LOGS_DIR        = ".agent_logs"
+SKILLS_DIR      = ".agent_skills"
+
+#-------------------------------------------------------------------------------
 
 # Hooks used by the optional Textual UI backend (see run_textual_ui).
 # When set, they redirect the three terminal-coupled mechanisms: console
@@ -79,6 +90,126 @@ MODEL_SINK = None  # callable(name): model switched -> UI header/config
 APPROVAL_HOOK = None  # callable(prompt) -> "y"|"n": UI-owned approval ask
 LOG_SINK = None  # callable(line, style): live log lines -> the Logs tab
 
+#----------------------------------------------------------------------------    
+
+STDOFFSET = timedelta(seconds = -time.timezone)
+if time.daylight:
+    DSTOFFSET = timedelta(seconds = -time.altzone)
+else:
+    DSTOFFSET = STDOFFSET
+
+DSTDIFF = DSTOFFSET - STDOFFSET
+ZERO = timedelta(0)
+
+class LocalTimezone(tzinfo):
+
+    def utcoffset(self, dt):
+        if self._isdst(dt):
+            return DSTOFFSET
+        else:
+            return STDOFFSET
+
+    def dst(self, dt):
+        if self._isdst(dt):
+            return DSTDIFF
+        else:
+            return ZERO
+
+    def tzname(self, dt):
+        return time.tzname[self._isdst(dt)]
+
+    def _isdst(self, dt):
+        tt = (dt.year, dt.month, dt.day,
+              dt.hour, dt.minute, dt.second,
+              dt.weekday(), 0, -1)
+        
+        try:
+            stamp = time.mktime(tt)
+        except (OverflowError, ValueError):
+            stamp = (datetime.datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second) - datetime.datetime(1970, 1, 1)).total_seconds()
+        
+        tt = time.localtime(stamp)
+
+        return tt.tm_isdst > 0
+
+LocalTz = LocalTimezone()
+
+#-------------------------------------------------------------------------------
+
+# change LOG_QUEUE_SIZE to > 1 for lazy log entry batch write
+LOG_QUEUE_SIZE = 1
+
+class FileLogFilter(logging.Filter):
+
+    def __init__(self, module_name):
+        self.module_name = module_name
+        
+        self.list_of_logs = []
+        self.nb_log_entry = LOG_QUEUE_SIZE
+        
+    def filter(self, record):
+
+        levelname=record.levelname ; module=record.module ; funcName=record.funcName ; lineno=record.lineno
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+
+        log_path = os.path.join(os.getcwd(), LOGS_DIR)
+        log_filename = "py-ai_" + "_".join( ["%02d" % s for s in time.localtime()[:3]] ) + ".log"
+
+        if levelname in ("WARNING", "ERROR"):
+            self.nb_log_entry = 1
+
+        try:
+            # ISO-8601 Time Stamp
+            t = datetime.datetime.fromtimestamp(time.time(), LocalTz).isoformat("T", timespec='milliseconds')
+
+            # Sequence Number
+            seq = ""
+            if levelname!="" and msg!="" and module!="" and funcName!="" and lineno!="":
+                seq = "".join( ["%02d" % s for s in time.localtime()[:3]] )
+
+            # PID info
+            pid_info = "%s:%s" % (os.getpid(), self.module_name)
+
+            try:
+                message = t + " - " + self.module_name + " - " + levelname + " - " + module + "." + funcName + "[" + str(lineno) + "]" + " | " + msg + "|(" + seq + ")\n"
+            except:
+                message = t + " - " + self.module_name + " - " + levelname + " - " + module + "." + funcName + "[" + str(lineno) + "]" + " | " + msg.decode("utf8") + "|(" + seq + ")\n"
+
+            if levelname!="" and msg!="" and module !="" and funcName!="" and lineno!="":
+                self.list_of_logs.append( message )
+            else:
+                self.nb_log_entry = LOG_QUEUE_SIZE
+            
+            if self.nb_log_entry < LOG_QUEUE_SIZE:
+                self.nb_log_entry += 1
+
+            else:
+
+                with open(os.path.join(log_path, log_filename), "at+", encoding=("utf-8")) as f:
+
+                    for mess in self.list_of_logs:
+                        try:
+                            f.write(mess)
+                        except (UnicodeDecodeError, UnicodeEncodeError):
+                            f.write(repr(mess))
+                            
+                    self.nb_log_entry = 0            
+                    self.list_of_logs = []
+                        
+                    f.flush()
+                    #os.fsync(f.fileno())
+                
+        except Exception as e:
+            # e.repr does not exist (it raised AttributeError inside the
+            # filter, inside the logger call); show the real error instead
+            print("FileLogFilter failed: %r" % (e,))
+
+        return True
+
+#----------------------------------------------------------------------------    
 
 class _SinkLogHandler(logging.Handler):
     """Forwards formatted records to LOG_SINK with a per-level color:
@@ -104,20 +235,24 @@ class _SinkLogHandler(logging.Handler):
         except Exception:
             pass  # logging must never break the agent
 
+#-------------------------------------------------------------------------------
 
 # --log-full / "/log full on": append every request payload and every
 # streamed SSE chunk to the log. Verbose by design -- it is the tool for
 # "what exactly did we send and receive", without leaving the Logs tab.
+
 LOG_FULL = False
 
-log = logging.getLogger("agent")
+log = logging.getLogger("py-ai")
 log.setLevel(logging.DEBUG)
 log.propagate = False
 _handler = _SinkLogHandler()
-_handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(levelname)s\t - %(funcName)s[%(lineno)d] | "%(message)s"'
-))
+_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s\t - %(funcName)s[%(lineno)d] | "%(message)s"'))
 log.addHandler(_handler)
+
+log.addFilter(FileLogFilter("py-ai"))
+
+#-------------------------------------------------------------------------------
 
 def merge_extra(base: dict, addition: dict) -> dict:
     """Merge request-body fields, one level deep. Nested maps such as
@@ -478,7 +613,6 @@ EDIT_FILE_DEFINITION = ToolDefinition(
 BASH_TIMEOUT_DEFAULT = 30      # seconds
 BASH_TIMEOUT_MAX = 300
 BASH_OUTPUT_CHARS = 20_000    # cap combined stdout+stderr, protects context
-BG_LOG_DIR = ".agent_logs"    # background job output
 BG_LOG_MAX_FILES = 50         # keep the newest N logs
 BG_LOG_MAX_AGE_DAYS = 7
 
@@ -561,6 +695,7 @@ BACKGROUND_OPS_GUIDANCE = (
     "byte counters or the size you actually sampled."
 )
 
+BACKGROUND_JOBS: list = []    # [{"pid", "command", "log", "started"}]
 
 def background_ops_block() -> str:
     """The guidance plus the live job list, or '' when nothing is running."""
@@ -574,8 +709,6 @@ def background_ops_block() -> str:
             f"\u00b7 log {job['log']}"
         )
     return BACKGROUND_OPS_GUIDANCE.format(jobs="\n".join(lines))
-BACKGROUND_JOBS: list = []    # [{"pid", "command", "log", "started"}]
-
 
 def job_alive(pid: int) -> bool:
     """Liveness probe for a process we may not own."""
@@ -586,7 +719,6 @@ def job_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
-
 
 def job_state(job: dict) -> str:
     """'running' or 'exit N'. Reaps finished children: without a wait()
@@ -612,7 +744,7 @@ def prune_background_logs(max_files: int = BG_LOG_MAX_FILES,
                           max_age_days: int = BG_LOG_MAX_AGE_DAYS) -> None:
     """Trim old background logs so a long-lived project does not accumulate
     them forever. Logs of jobs still running are never removed."""
-    directory = Path(BG_LOG_DIR)
+    directory = Path(LOGS_DIR)
     if not directory.is_dir():
         return
     live = {
@@ -685,10 +817,10 @@ def poll_job(job: dict, timeout: Optional[float]) -> str:
 def launch_detached(command: str) -> dict:
     """Start `command` in its own session with output to a log file, and
     register it as a background job. Returns the job record."""
-    Path(BG_LOG_DIR).mkdir(parents=True, exist_ok=True)
+    
     prune_background_logs()
     slug = re.sub(r"[^a-z0-9]+", "-", command.lower())[:24].strip("-") or "job"
-    log_path = Path(BG_LOG_DIR) / f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}.log"
+    log_path = Path(LOGS_DIR) / f"{time.strftime('%Y%m%d-%H%M%S')}-{slug}.log"
     # rc is captured before echoing and re-raised at the end, so the log
     # trailer AND our own waitpid both report the command's status rather
     # than the echo's (which would always be 0)
@@ -1570,10 +1702,6 @@ a <tool_result name="..."> block; error="true" on that tag means the call failed
 - When you have everything you need, answer the user normally, without any \
 <tool_call> block."""
 
-MAX_TURN_REQUESTS = 25  # hard backstop: max model requests in one turn
-# Session-level budgets. MAX_TURN_REQUESTS bounds one turn; an unattended
-# run needs a ceiling on the WHOLE session, or a loop that keeps making
-# progress by the fingerprint rule can still run for hours.
 UNATTENDED_REQUESTS = 200
 UNATTENDED_SECONDS = 3600
 UNATTENDED_TOKENS = 0        # 0 = unlimited unless asked for
@@ -2420,9 +2548,12 @@ def is_context_overflow(body: str) -> bool:
 
     llama.cpp: "exceeds the available context size" / exceed_context_size_error
     vLLM/OpenAI: "maximum context length is N tokens" / context_length_exceeded
+    Maya / Strata: {"error": {"type": "invalid_request_error", "message": "prompt (63255 tokens) 
+           + max tokens (65536) exceeds the context (128000); requests are never truncated"}}
     """
     b = body.lower()
-    if "exceed_context" in b or "context_length_exceeded" in b:
+    #if ("exceed_context" in b) or ("context_length_exceeded" in b):
+    if ("context" in b) and ("exceed" in b):
         return True
     return "context" in b and ("size" in b or "length" in b or "window" in b)
 
@@ -2962,10 +3093,6 @@ class JsonSessionStore(SessionStore):
         except OSError:
             return False
 
-
-SKILLS_DIR = ".skills"
-
-
 def mangle_skill_name(text: str) -> str:
     """Unique, filesystem-safe name derived from the skill text: a slug
     of the first line plus a content hash (same text -> same name)."""
@@ -2991,7 +3118,7 @@ SKILL_DESCRIPTION_MAX = 1024
 # .agents/skills is the vendor-neutral cross-client location from the
 # specification. Other clients keep skills elsewhere; add those with
 # --skills-search rather than hardcoding a vendor's directory here.
-SKILL_SEARCH_DIRS = (".agents/skills",)
+SKILL_SEARCH_DIRS = (SKILLS_DIR, ".agents/skills",)
 SKILL_USER_DIRS = ("~/.agents/skills",)
 SKILL_EXTRA_DIRS: list = []      # from --skills-search
 
@@ -3552,12 +3679,8 @@ def split_for_compression(messages: list, keep: int):
         return None
     return messages[:summarized_n], tail, summarized_n
 
-
-MEMORIES_DIR = ".memories"
-
-
 class MemoryManager:
-    """Memories: distilled session knowledge stored under .memories/.
+    """Memories: distilled session knowledge stored under .agent_memories/.
     Several can be loaded at once; loaded memories are injected at the
     system level of every request alongside any active skill."""
 
@@ -4739,6 +4862,7 @@ class Agent:
         max_tokens: int = 4096,
         retries: int = 3,
         max_nudges: int = 2,
+        max_turn_requests: int = 32,
         reasoning_mode: str = "collapsed",  # full | collapsed | hidden
         temperature: Optional[float] = None,
         dry_params: Optional[dict] = None,
@@ -4820,6 +4944,7 @@ class Agent:
         self.max_tokens = max_tokens
         self.retries = retries
         self.max_nudges = max_nudges
+        self.max_turn_requests = max_turn_requests
         self.reasoning_mode = reasoning_mode
         self.turn_reasonings: list[str] = []  # ALL reasoning blocks this turn
         self._fail_counts: dict = {}  # loop guard: failures per signature (per turn)
@@ -6017,9 +6142,8 @@ class Agent:
         self._turn_requests = 0  # model requests this user-turn (loop ceiling)
         self._forced_final_used = False
         self.files.begin_turn()
-        log.info("user turn begins: %d messages in context, protocol=%s",
-                 len(self.conversation), self.mode)
         self.expanded = "think" if self.reasoning_mode == "full" else None
+        log.info("user turn begins: %d messages in context, protocol=%s", len(self.conversation), self.mode)
 
     HELP_ENTRIES = (
         ("/help /h /?", "this list"),
@@ -7076,7 +7200,7 @@ class Agent:
                     # loop, so an iteration has to drive it too or a fix
                     # needing a tool call plus a follow-up gets cut in half.
                     settled, steps = False, 0
-                    while not settled and steps < MAX_TURN_REQUESTS:
+                    while not settled and steps < self.max_turn_requests:
                         settled = (self._native_turn(conversation)
                                    if self.mode == "native"
                                    else self._text_turn(conversation))
@@ -7864,6 +7988,10 @@ class Agent:
              "stream-error/backoff retry attempts"),
             ("max_nudges", str(self.max_nudges),
              "empty/reasoning-only re-prompts per turn"),
+
+            ("max_turn_requests", str(self.max_turn_requests),
+             "Hard backstop: max model requests in one turn"),
+
             ("reasoning", self.reasoning_mode,
              "collapsed / full / hidden in the chat"),
             ("tools", "on" if self.allow_tools else "OFF (--no-tools)",
@@ -8231,12 +8359,14 @@ class Agent:
                         notice(
                             "request exceeds the context window -- truncated "
                             "the largest tool result and retrying"
+                            "\nyou might want to use /max-tokens to reduce the current value"
                         )
                         continue
                     raise TurnAborted(
                         "request exceeds the server's context window and "
-                        "nothing more can be truncated -- try a smaller "
-                        "request"
+                        "nothing more can be truncated -- try a smaller request"
+                        "\nyou might want to use /max-tokens to reduce the current value"
+
                     ) from err
                 if err.status == 400:
                     # Identify the offending parameter from the error body
@@ -8490,14 +8620,12 @@ class Agent:
         nudge_messages: list = []
         while True:
             self._turn_requests += 1
-            if self._turn_requests > MAX_TURN_REQUESTS:
-                log.warning("turn exceeded %d requests; returning control",
-                            MAX_TURN_REQUESTS)
-                self._forced_final_turn(
-                    conversation,
-                    f"turn hit the {MAX_TURN_REQUESTS}-request ceiling",
-                )
+
+            if self._turn_requests > self.max_turn_requests:
+                log.warning("turn exceeded %d requests; returning control", self.max_turn_requests)
+                self._forced_final_turn(conversation, f"turn hit the {self.max_turn_requests}-request ceiling",)
                 return True
+            
             request_messages = list(conversation) + nudge_messages
             system_bits = []
             if self.system_prompt:  # custom persona (native has no protocol)
@@ -8572,16 +8700,14 @@ class Agent:
         """Runs one turn; returns True if we should read user input next."""
         nudges = 0
         nudge_messages: list = []   # transient, as in _native_turn
+
         while True:
             self._turn_requests += 1
-            if self._turn_requests > MAX_TURN_REQUESTS:
-                log.warning("turn exceeded %d requests; returning control",
-                            MAX_TURN_REQUESTS)
-                self._forced_final_turn(
-                    conversation,
-                    f"turn hit the {MAX_TURN_REQUESTS}-request ceiling",
-                )
+            if self._turn_requests > self.max_turn_requests:
+                log.warning("turn exceeded %d requests; returning control", self.max_turn_requests)
+                self._forced_final_turn(conversation, f"turn hit the {self.max_turn_requests}-request ceiling",)
                 return True
+            
             messages = [
                 {"role": "system", "content": self.text_system_prompt}
             ] + list(conversation) + nudge_messages
@@ -9763,6 +9889,7 @@ def run_textual_ui(agent: "Agent", initial_commands=None) -> None:
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
+
 def _serve(args, argv: list) -> None:
     """Re-launch this program (minus --serve) under textual-serve, so the
     Textual UI renders in a browser. The child runs the normal --ui
@@ -9771,17 +9898,19 @@ def _serve(args, argv: list) -> None:
         from textual_serve.server import Server
     except ImportError:
         sys.exit("--serve needs textual-serve: pip install textual-serve")
+
     inner = [a for a in argv if a not in ("--serve",)]
+    
     if "--ui" not in " ".join(inner):
         inner += ["--ui", "textual"]
-    child = f"{sys.executable} {shlex.quote(sys.argv[0])} " + " ".join(
-        shlex.quote(a) for a in inner
-    )
+    
+    child = f"{sys.executable} {shlex.quote(sys.argv[0])} " + " ".join(shlex.quote(a) for a in inner)
+
     env_prefix = "PY_AI_SERVED=1 "
-    log.info("serving on http://%s:%d -> %s", args.serve_host,
-             args.serve_port, child)
+    log.info("serving on http://%s:%d -> %s", args.serve_host, args.serve_port, child)
     print(f"Serving py-ai on http://{args.serve_host}:{args.serve_port}")
     print("Open that URL in a browser. Ctrl-C here to stop.")
+
     Server(
         env_prefix + child,
         host=args.serve_host,
@@ -9789,8 +9918,10 @@ def _serve(args, argv: list) -> None:
         title="py-ai \u00a9 devpack",
     ).serve()
 
+# -------------------------------------------------------------------
 
 def main() -> None:
+
     parser = argparse.ArgumentParser(
         description="A tiny streaming code-editing agent for any "
         "OpenAI-compatible endpoint."
@@ -9843,6 +9974,16 @@ def main() -> None:
         "--max-nudges", type=int, default=2,
         help="Max continue-nudges per turn for empty/reasoning-only replies",
     )
+    
+    # hard backstop: max model requests in one turn
+    # Session-level budgets. MAX_TURN_REQUESTS bounds one turn; an unattended
+    # run needs a ceiling on the WHOLE session, or a loop that keeps making
+    # progress by the fingerprint rule can still run for hours.
+    parser.add_argument(
+        "--max-turn-requests", type=int, default=32,
+        help="Hard backstop: max model requests in one turn",
+    )
+
     parser.add_argument(
         "--reasoning",
         choices=["collapsed", "full", "hidden"],
@@ -9902,7 +10043,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--approval",
-        default="low",
+        default="high",
         metavar="LEVEL",
         help="Max risk level to AUTO-APPROVE for tool execution: "
         "all (prompt everything), low, medium (default: prompt only "
@@ -10226,26 +10367,38 @@ def main() -> None:
     dry.add_argument("--dry-base", type=float, default=None)
     dry.add_argument("--dry-allowed-length", type=int, default=None)
     dry.add_argument("--dry-penalty-last-n", type=int, default=None)
+
+    # All args
     args = parser.parse_args()
+
+    # mkdir
+    Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
+    Path(SKILL_SEARCH_DIRS[0]).mkdir(parents=True, exist_ok=True)
+    Path(MEMORIES_DIR).mkdir(parents=True, exist_ok=True)
 
     # --task turns this into a batch run: collected first, because it
     # decides the UI and whether the exit code is meaningful
     tasks: list = list(args.task or [])
     if args.task_file:
         try:
-            tasks.append(sys.stdin.read() if args.task_file == "-"
-                         else Path(args.task_file).read_text())
+            tasks.append(sys.stdin.read() if args.task_file == "-" else Path(args.task_file).read_text())
         except OSError as err:
             sys.exit(f"--task-file: {err}")
+
     tasks = [task.strip() for task in tasks if task and task.strip()]
+
+    # a batch run must not leave a TUI sitting there when it finishes
     if tasks and args.ui != "rich":
-        # a batch run must not leave a TUI sitting there when it finishes
         args.ui = "rich"
 
+    # key - model
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or "sk-no-key-required"
-    model = resolve_model(args.model, probe_models(args.base_url, api_key))
+    model   = resolve_model(args.model, probe_models(args.base_url, api_key))
+
     if args.transport == "sdk" and openai is None:
-        sys.exit("--transport sdk needs the openai package: pip install openai")
+        sys.exit("--transport sdk needs the openai package, use uv or pip to install it")
+
+    # chat client
     client_cls = SdkChatClient if args.transport == "sdk" else HttpxChatClient
     client = client_cls(
         base_url=args.base_url,
@@ -10254,15 +10407,47 @@ def main() -> None:
         timeout=args.timeout,
     )
 
+    # ctx size tracker
     if args.ctx_size:
         tracker = TokenTracker(args.ctx_size, "--ctx-size")
     else:
-        ctx_size, ctx_source = probe_context_window(
-            args.base_url, api_key, model
-        )
+        ctx_size, ctx_source = probe_context_window(args.base_url, api_key, model)
+
         tracker = TokenTracker(ctx_size, ctx_source)
+
+    # server settings
     server_settings = probe_sampler_settings(args.base_url, api_key)
 
+    # max-tokens vs context size check
+    if(ctx_size <= args.max_tokens):
+        console.print(Text(f"The max-tokens value ({args.max_tokens}), exceed the context ({ctx_size})", style="red"))
+        console.print(Text(f"Please enter a lower value than {ctx_size*0.75} ", style="red"))
+
+        setup_line_editing()
+        input_prompt = build_input_prompt()
+
+        def get_user_message() -> Optional[str]:
+            while True:
+                try:
+                    line = input(input_prompt)
+                except EOFError:
+                    return None
+                if line.strip():
+                    return line  # blank lines just re-prompt
+                
+        while True:
+            try:
+                max_t = int(get_user_message())
+                if max_t > ctx_size*0.75:
+                    raise
+                args.max_tokens = max_t
+                break
+            except ValueError:
+                console.print(Text(f"Please enter a numerical lower value than {ctx_size*0.75} ", style="orange1"))
+            except:
+                console.print(Text(f"Please enter a lower value than {ctx_size*0.75} ", style="orange1"))
+
+    # tasks ?
     if tasks:
         pending_tasks = list(tasks)
 
@@ -10274,6 +10459,8 @@ def main() -> None:
             task = pending_tasks.pop(0)
             console.print(Text(f"You \u276f {task}", style="bold blue"))
             return task
+        
+    # TUI
     elif args.ui == "rich":
         setup_line_editing()
         input_prompt = build_input_prompt()
@@ -10290,9 +10477,11 @@ def main() -> None:
         def get_user_message() -> Optional[str]:
             return None  # replaced by the Textual UI's input queue
 
+    # registry
     registry = ToolRegistry(ALL_TOOLS, args.tools_file)
     registry.ensure_file()
     notice(registry.load())
+
     # --serve: hand off to textual-serve unless we ARE the served child
     if args.serve and not os.environ.get("PY_AI_SERVED"):
         _serve(args, sys.argv[1:])
@@ -10306,14 +10495,18 @@ def main() -> None:
         allow_bash = args.bash_escape
 
     set_read_limits(chars=args.read_limit_chars, lines=args.read_limit_lines)
+
     global LOG_FULL
     if args.skills_search:
         SKILL_EXTRA_DIRS.extend(args.skills_search)
+
     LOG_FULL = args.log_full
     log.setLevel(getattr(logging, args.log_level.upper()))
+
     if LOG_FULL:
         log.info("full logging enabled: request bodies and SSE chunks")
 
+    #extra_body
     extra_body: dict = {}
     if args.extra_body:
         try:
@@ -10322,11 +10515,12 @@ def main() -> None:
             sys.exit(f"--extra-body: not valid JSON ({err})")
         if not isinstance(parsed, dict):
             sys.exit("--extra-body: must be a JSON object")
+        
         extra_body = parsed
+
     if args.thinking is not None:
-        extra_body = merge_extra(
-            extra_body, thinking_extra(args.thinking,
-                                       level_key=args.thinking_key))
+        extra_body = merge_extra(extra_body, thinking_extra(args.thinking,
+                                 level_key=args.thinking_key))
 
     # --plan takes a mode or a task description
     planning_mode, startup_task = "off", None
@@ -10335,19 +10529,21 @@ def main() -> None:
     elif args.plan.strip():
         startup_task = args.plan.strip()
 
+    # sys
     system_prompt = args.system
     if args.system_file:
         try:
             system_prompt = Path(args.system_file).read_text().strip()
         except OSError as err:
             sys.exit(f"--system-file: {err}")
-    policy = PolicyEngine(
-        confine_paths=not args.no_path_confinement,
-        enforce_denylist=not args.no_command_denylist,
-    )
+
+    policy = PolicyEngine(confine_paths=not args.no_path_confinement,
+                          enforce_denylist=not args.no_command_denylist,)
+
     if args.no_path_confinement or args.no_command_denylist:
         log.warning("injection defenses reduced: confine_paths=%s denylist=%s",
                     not args.no_path_confinement, not args.no_command_denylist)
+        
     # --unattended supplies budget defaults; explicit flags always win
     if args.max_session_requests is None:
         args.max_session_requests = (UNATTENDED_REQUESTS if args.unattended
@@ -10362,8 +10558,10 @@ def main() -> None:
 
     if args.verify_rounds is None:
         resolved_mode = args.verify_mode
+
         if resolved_mode == "auto":
             resolved_mode = "iterate" if args.verify_command else "revise"
+
         args.verify_rounds = (ITERATE_ROUNDS_DEFAULT
                               if resolved_mode == "iterate"
                               else REVISE_ROUNDS_DEFAULT)
@@ -10374,6 +10572,7 @@ def main() -> None:
         notice(f"engine: {engine} (detected)")
     else:
         notice(f"engine: {engine}")
+
     store = JsonSessionStore(args.sessions_dir)
     skills = SkillManager(args.skills_dir)
     memories = MemoryManager(args.memories_dir)
@@ -10420,6 +10619,7 @@ def main() -> None:
         max_tokens=args.max_tokens,
         retries=args.retries,
         max_nudges=args.max_nudges,
+        max_turn_requests=args.max_turn_requests,
         reasoning_mode="hidden" if args.hide_reasoning else args.reasoning,
         temperature=args.temperature,
         dry_params={
@@ -10432,7 +10632,9 @@ def main() -> None:
         server_settings=server_settings,
         show_raw=args.raw,
     )
+
     agent.allow_bash_escape = allow_bash
+    
     if not args.tools:
         log.warning("tools DISABLED for this session (--no-tools)")
     if not args.internet:
@@ -10440,6 +10642,7 @@ def main() -> None:
     if not allow_bash:
         log.info("! shell escape disabled for this session")
 
+    # GUI ?
     if args.ui == "textual":
         initial = []
         if args.resume:
@@ -10448,7 +10651,9 @@ def main() -> None:
             initial.append(f"/skill {args.skill}")
         if startup_task:
             initial.append(f"/plan new {startup_task}")
+
         run_textual_ui(agent, initial_commands=initial or None)
+
         if args.report:
             agent.write_report(args.report)
         if machine_driven:
