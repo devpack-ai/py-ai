@@ -314,6 +314,7 @@ def make_agent(server=None, **kwargs) -> "A.Agent":
         protocol="native",
         retries=1,
         max_nudges=1,
+        max_turn_requests=32,
         policy=A.PolicyEngine(root=os.getcwd()),
         tracker=A.TokenTracker(32768, "test-model"),
     )
@@ -350,6 +351,7 @@ def make_stub_agent(**overrides):
         max_tokens = 4096
         retries = 3
         max_nudges = 2
+        max_turn_requests = 32
         risk_classifier = "heuristic"
         approve_level = "low"
         yolo = False

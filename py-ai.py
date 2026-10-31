@@ -188,6 +188,12 @@ class FileLogFilter(logging.Filter):
 
             else:
 
+                # LOGS_DIR is relative to the cwd and only main() creates it.
+                # Where it is absent, skip the flush quietly: creating it here
+                # would scatter .agent_logs into every cwd the module is
+                # imported from, and the old bare open() printed
+                # "FileLogFilter failed" on every WARNING, polluting captured
+                # console output. Records still go to the in-memory sink.
                 with open(os.path.join(log_path, log_filename), "at+", encoding=("utf-8")) as f:
 
                     for mess in self.list_of_logs:
@@ -195,13 +201,13 @@ class FileLogFilter(logging.Filter):
                             f.write(mess)
                         except (UnicodeDecodeError, UnicodeEncodeError):
                             f.write(repr(mess))
-                            
-                    self.nb_log_entry = 0            
+
+                    self.nb_log_entry = 0
                     self.list_of_logs = []
-                        
+
                     f.flush()
                     #os.fsync(f.fileno())
-                
+
         except Exception as e:
             # e.repr does not exist (it raised AttributeError inside the
             # filter, inside the logger call); show the real error instead
@@ -755,7 +761,9 @@ def prune_background_logs(max_files: int = BG_LOG_MAX_FILES,
         entries = [
             (path.stat().st_mtime, path)
             for path in directory.glob("*.log")
-            if str(path) not in live
+            # the app's own rolling log lives in LOGS_DIR too, but it is not
+            # a job log: pruning by count would delete the live one
+            if str(path) not in live and not path.name.startswith("py-ai_")
         ]
     except OSError:
         return
@@ -827,6 +835,11 @@ def launch_detached(command: str) -> dict:
     inner = (current_sandbox_prefix()
              + f'({command}); rc=$?; echo "[exit: $rc]"; exit $rc')
     try:
+        # LOGS_DIR is relative to the cwd and is normally created by main();
+        # a tool call from a cwd where it does not exist (fresh directory, or
+        # an imported-module test) must still be able to detach, so make the
+        # parent here rather than failing the command.
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("w") as handle:
             handle.write(f"$ {command}\n")
             handle.flush()
@@ -1679,8 +1692,25 @@ class ToolRegistry:
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
+# The identity sentence, kept as ONE paragraph: build_text_system_prompt
+# splits the text prompt at the first blank line to swap the persona while
+# preserving the tool machinery, so this must never contain a blank line.
+#
+# It is the single source of truth for BOTH protocols. Native mode used to
+# send no system message at all unless --system/--system-file or a
+# skill/memory/plan/job supplied one -- leaving the system slot filled only
+# by whatever the server's chat template injects (an inference-effort note,
+# typically). With no identity anchor the model's pretrained persona prior
+# filled the vacuum and confidently reported being some other product's
+# assistant. An unconditional persona is what _text_turn already did.
+AGENT_PERSONA = (
+    "You are a coding agent working in the user's current directory. "
+    "You have access to tools."
+    "Higher the reasoning effort, more it is needed to validate assumptions, think carefully the chain of thoughts and prioritize correctness."
+)
+
 TEXT_SYSTEM_PROMPT_TEMPLATE = """\
-You are a coding agent working in the user's current directory. You have access to tools.
+{persona}
 
 Available tools:
 
@@ -2447,17 +2477,17 @@ def build_text_system_prompt(
             f"{tool.description}\n"
             f"Parameters schema: {json.dumps(tool.input_schema)}"
         )
+    # The template's persona slot always holds AGENT_PERSONA (one paragraph,
+    # so the split below is well-defined). A custom prompt replaces only that
+    # intro line; the tool list AND the tool-calling protocol beneath it are
+    # preserved, or the model can no longer emit <tool_call> blocks in text
+    # mode. (Native mode has no protocol text -- see native_system_prompt,
+    # where the override stands alone, blank lines and all.)
     base = TEXT_SYSTEM_PROMPT_TEMPLATE.format(
-        tool_descriptions="\n\n".join(descriptions)
+        persona=AGENT_PERSONA, tool_descriptions="\n\n".join(descriptions)
     )
     if not override:
         return base
-    # A custom prompt replaces only the intro persona line; the tool list
-    # AND the tool-calling protocol below it are preserved, or the model
-    # can no longer emit <tool_call> blocks in text mode. (Native mode has
-    # no protocol text -- see text_system_prompt / _native_turn, where the
-    # override stands alone.) Split at the first blank line, which ends the
-    # persona sentence and precedes "Available tools:".
     machinery_start = base.index("\n\n")  # end of the intro line
     return override.strip() + base[machinery_start:]
 
@@ -4378,8 +4408,15 @@ def choose_model(models: list[str]) -> str:
     )
     table.add_column("#", style="grey50", justify="right")
     table.add_column("model", style="bold")
+    # Pretty names keep the list readable, but two shards/quantisations can
+    # prettify identically; those rows keep the raw id so the choice is
+    # still unambiguous.
+    counts: dict[str, int] = {}
+    for model in models:
+        counts[display_model_name(model)] = counts.get(display_model_name(model), 0) + 1
     for i, model in enumerate(models, 1):
-        table.add_row(str(i), model)
+        pretty = display_model_name(model)
+        table.add_row(str(i), pretty if counts[pretty] == 1 else model)
     console.print(table)
     while True:
         try:
@@ -4390,8 +4427,9 @@ def choose_model(models: list[str]) -> str:
             return models[0]
         if raw.isdigit() and 1 <= int(raw) <= len(models):
             return models[int(raw) - 1]
-        if raw in models:
-            return raw
+        picked = resolve_model_input(raw, models)
+        if picked is not None:
+            return picked
         notice("enter a number from the list or an exact model id")
 
 
@@ -4413,6 +4451,54 @@ def resolve_model(explicit: Optional[str], models: list[str]) -> str:
         notice(f"model auto-detected from /v1/models: {models[0]}")
         return models[0]
     return choose_model(models)
+
+
+SHARD_RE = re.compile(r"-\d+-of-\d+(?=\.\w+$|$)")  # Hugging Face sharded files:
+# "...-UD-IQ4_XS-00001-of-00005.gguf" -> "...-UD-IQ4_XS.gguf"
+
+
+def display_model_name(model: str) -> str:
+    """Pretty model name for UI titles.
+
+    llama.cpp reports the loaded GGUF's file path as the model id
+    ("/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf"); for titles show just the
+    file stem. Real model ids (vLLM/OpenAI) pass through unchanged.
+    Sharded-file suffixes ("-00001-of-00005") are dropped so every shard
+    of a model displays under its base name.
+    """
+    if not model:
+        return model
+    name = model.replace("\\", "/").rsplit("/", 1)[-1]
+    if name.lower().endswith(".gguf"):
+        name = name[: -len(".gguf")]
+    name = SHARD_RE.sub("", name)
+    return name or model
+
+
+def resolve_model_input(typed: str, models: list[str]) -> Optional[str]:
+    """Map what the user typed onto an id the server actually serves.
+
+    Listings show display_model_name(), so "/model GLM-5.3-Flash-UD-IQ4_XS"
+    has to find "/models/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf" --
+    typing the pretty name back would otherwise be rejected, or worse, sent
+    as a wire id that matches nothing. Exact ids win; a pretty name or an
+    unambiguous fragment is enough when only one listed model matches.
+    None means "no idea": callers keep their old behaviour and pass the
+    text through, which is what lets /model switch to an unlisted id.
+    """
+    if not typed or not models:
+        return None
+    if typed in models:
+        return typed
+    pretty = {display_model_name(m): m for m in models}
+    if typed in pretty:
+        return pretty[typed]
+    low = typed.lower()
+    hits = list(dict.fromkeys(
+        m for m in models
+        if low in m.lower() or low in display_model_name(m).lower()
+    ))
+    return hits[0] if len(hits) == 1 else None
 
 
 def settings_collapsed_line(settings: dict) -> Text:
@@ -4928,7 +5014,11 @@ class Agent:
         kind, level = normalize_approval(approval)
         self.approve_level = level if kind == "level" else None
         self.yolo = yolo or kind == "yolo"
-        self.system_prompt = system_prompt  # None = built-in default
+        # None = built-in AGENT_PERSONA. It replaces only the persona line in
+        # text mode (tool machinery is appended beneath) and the persona in
+        # native mode -- see build_text_system_prompt / native_system_prompt.
+        # A non-None value never suppresses the system message in either mode.
+        self.system_prompt = system_prompt
         self.allow_tools = allow_tools        # master tool switch
         self.allow_internet = allow_internet  # gates search_web / network
         self.allow_bash_escape = True         # set from main() per --serve
@@ -5085,6 +5175,21 @@ class Agent:
         if extras:
             prompt += "\n\n" + extras
         return prompt
+
+    @property
+    def native_system_prompt(self) -> str:
+        # Native mode has no protocol text to send (tools travel as JSON),
+        # but it still needs the identity anchor: with an empty system slot
+        # the server template's boilerplate is the only thing defining who
+        # the model is, and the pretrained persona prior answers instead.
+        # A custom --system/--system-file replaces only the persona, exactly
+        # as in text mode; extras (plan/jobs/skills/memories) still append.
+        bits = [self.system_prompt.strip() if self.system_prompt
+                else AGENT_PERSONA]
+        extras = self._system_extras()
+        if extras:
+            bits.append(extras)
+        return "\n\n".join(bits)
 
     # --- sessions --------------------------------------------------------- #
     def _print_banner(self) -> None:
@@ -6295,15 +6400,23 @@ class Agent:
         models = probe_models(self.client.base_url, self.client.api_key)
         if not models:
             notice(
-                f"current model: {self.client.model} \u00b7 the endpoint "
-                "lists none (/model <name> still switches)"
+                f"current model: {display_model_name(self.client.model)} \u00b7 "
+                "the endpoint lists none (/model <name> still switches)"
             )
             return
         self._model_listing = models
+        counts: dict[str, int] = {}
+        for name in models:
+            counts[display_model_name(name)] = counts.get(
+                display_model_name(name), 0) + 1
         for index, name in enumerate(models, 1):
             marker = " *" if name == self.client.model else ""
-            console.print(Text(f"  {index}. {name}{marker}", style="grey50"))
-        notice(f"/model <n|name> switches \u00b7 * = current")
+            pretty = display_model_name(name)
+            # ambiguous pretty names fall back to the raw id, which is also
+            # what /model <name> needs when the short form matches several
+            shown = pretty if counts[pretty] == 1 else name
+            console.print(Text(f"  {index}. {shown}{marker}", style="grey50"))
+        notice("/model <n|name> switches \u00b7 * = current")
 
     def _model_command(self, arg: str) -> None:
         arg = arg.strip()
@@ -6318,8 +6431,16 @@ class Agent:
                 notice(f"no model #{arg} (see /model)")
                 return
             arg = listing[index]
+        # Listings show pretty names, so accept the pretty form too; an
+        # unknown string still passes through (switching to an id the
+        # server does not list is legal and sometimes necessary).
+        resolved = resolve_model_input(
+            arg, getattr(self, "_model_listing", None)
+            or probe_models(self.client.base_url, self.client.api_key))
+        if resolved is not None:
+            arg = resolved
         if arg == self.client.model:
-            notice(f"already using {arg}")
+            notice(f"already using {display_model_name(arg)}")
             return
 
         previous = self.client.model
@@ -6342,7 +6463,8 @@ class Agent:
             self.mode = "native"
             retried_native = True
 
-        notice(f"model: {previous} \u2192 {arg}")
+        notice(f"model: {display_model_name(previous)} \u2192 "
+               f"{display_model_name(arg)}")
         if size:
             notice(f"  context window: {size:,} tokens (from {source})")
         if retried_native:
@@ -7990,7 +8112,8 @@ class Agent:
              "empty/reasoning-only re-prompts per turn"),
 
             ("max_turn_requests", str(self.max_turn_requests),
-             "Hard backstop: max model requests in one turn"),
+             "Hard backstop: max model requests in one turn "
+             "(--max-turn-requests)"),
 
             ("reasoning", self.reasoning_mode,
              "collapsed / full / hidden in the chat"),
@@ -8626,17 +8749,25 @@ class Agent:
                 self._forced_final_turn(conversation, f"turn hit the {self.max_turn_requests}-request ceiling",)
                 return True
             
-            request_messages = list(conversation) + nudge_messages
-            system_bits = []
-            if self.system_prompt:  # custom persona (native has no protocol)
-                system_bits.append(self.system_prompt)
-            extras = self._system_extras()
-            if extras:
-                system_bits.append(extras)
-            if system_bits:  # per-request, never stored: prefix-stable
-                request_messages = [
-                    {"role": "system", "content": "\n\n".join(system_bits)}
-                ] + list(conversation) + nudge_messages
+            # request_messages = list(conversation) + nudge_messages
+            # system_bits = []
+            # if self.system_prompt:  # custom persona (native has no protocol)
+            #     system_bits.append(self.system_prompt)
+            # extras = self._system_extras()
+            # if extras:
+            #     system_bits.append(extras)
+            # if system_bits:  # per-request, never stored: prefix-stable
+            #     request_messages = [
+            #         {"role": "system", "content": "\n\n".join(system_bits)}
+            #     ] + list(conversation) + nudge_messages
+
+            # The system message is always sent (see native_system_prompt):
+            # unconditionally, so the identity anchor can never be absent.
+            # Still per-request and never stored, so it stays prefix-stable
+            # and a skill/plan toggle costs nothing permanent.
+            request_messages = [
+                {"role": "system", "content": self.native_system_prompt}
+            ] + list(conversation) + nudge_messages
             result = self._stream_with_recovery(
                 request_messages, native_tools=True
             )
@@ -10409,10 +10540,10 @@ def main() -> None:
 
     # ctx size tracker
     if args.ctx_size:
-        tracker = TokenTracker(args.ctx_size, "--ctx-size")
+        ctx_size = args.ctx_size
+        tracker = TokenTracker(ctx_size, "--ctx-size")
     else:
         ctx_size, ctx_source = probe_context_window(args.base_url, api_key, model)
-
         tracker = TokenTracker(ctx_size, ctx_source)
 
     # server settings

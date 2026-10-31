@@ -7,6 +7,7 @@ is actually plumbed through to the request rather than merely parsed.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -213,8 +214,18 @@ def test_cli_sampler_and_context_flags_reach_the_request():
         assert payload["dry_base"] == 1.9
         assert payload["dry_allowed_length"] == 3
         assert payload["stream"] is True
-        assert "8,182 left" in " ".join(completed.stdout.split()) or \
-               "8192" in completed.stdout        # --ctx-size drives the bar
+        # --ctx-size must drive both the banner and the headroom bar. Assert
+        # the arithmetic (used + left == the configured window) rather than a
+        # literal "left" figure: the prompt-token estimate moves with the
+        # system prompt, so a pinned number breaks on any wording change.
+        flat = " ".join(completed.stdout.split())
+        assert "context 8,192 tokens (--ctx-size)" in flat
+        used = re.search(r"ctx used ~([\d,]+) \(\d+ req\)", flat)
+        left = re.search(r"ctx ~([\d,]+) left \(\d+%\)", flat)
+        assert used and left, flat[-300:]
+        total = (int(used.group(1).replace(",", ""))
+                 + int(left.group(1).replace(",", "")))
+        assert total == 8192, total
     finally:
         server.stop()
 

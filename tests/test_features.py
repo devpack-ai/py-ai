@@ -63,11 +63,16 @@ def test_skill_injection_in_both_protocols():
         assert first["role"] == "system" and "Active skill" in first["content"]
         assert agent.conversation[0]["role"] == "user"   # not persisted
 
-        # deactivating removes it from the very next request
+        # deactivating removes it from the very next request. The system
+        # message itself never disappears: native mode always sends the
+        # persona, so only the skill block is expected to be gone.
         agent._set_skill("off")
         server.push(*answer("ok"))
         agent._native_turn(agent.conversation)
-        assert server.last_request["messages"][0]["role"] == "user"
+        first = server.last_request["messages"][0]
+        assert first["role"] == "system"
+        assert "Active skill" not in first["content"]
+        assert first["content"] == A.AGENT_PERSONA   # persona, nothing else
     finally:
         server.stop()
 
@@ -467,15 +472,17 @@ def test_turn_request_ceiling_stops_endless_tool_calls():
     nudge cap; only the per-user-turn request ceiling ends it."""
     server = FakeServer()
     try:
-        for index in range(A.MAX_TURN_REQUESTS + 5):
+        # the ceiling is per-agent (--max-turn-requests): build the agent
+        # first, then over-supply replies so only the ceiling can end it
+        agent = make_agent(server, yolo=True, messages=["go"])
+        for index in range(agent.max_turn_requests + 5):
             server.push(tool_call_chunk("run_bash", {"command": f"echo {index}"},
                                         call_id=f"t{index}"))
-        agent = make_agent(server, yolo=True, messages=["go"])
         with recorded_console(width=140) as output:
             agent.run()
             text = output()
         assert "request ceiling" in text
-        assert server.count <= A.MAX_TURN_REQUESTS + 1, server.count
+        assert server.count <= agent.max_turn_requests + 1, server.count
     finally:
         server.stop()
 
@@ -681,6 +688,7 @@ def test_config_entries_works_on_a_minimal_agent():
         temperature = None
         retries = 1
         max_nudges = 1
+        max_turn_requests = 32
         reasoning_mode = "collapsed"
         allow_tools = True
         allow_internet = True
@@ -694,7 +702,7 @@ def test_config_entries_works_on_a_minimal_agent():
         skills = None
         memories = None
         policy = None
-    assert len(A.Agent.config_entries(Bare())) >= 20
+    assert len(A.Agent.config_entries(Bare())) >= 21
 
 
 def test_no_skills_are_shipped_with_the_agent():
@@ -845,7 +853,7 @@ def test_config_covers_every_meaningful_flag():
         "--plan",               # shown as "planning"
         "--transport",          # shown as "transport"
         "--protocol", "--ui", "--engine", "--approval", "--temperature",
-        "--timeout", "--retries", "--max-tokens", "--max-nudges",
+        "--timeout", "--retries", "--max-tokens", "--max-nudges", "--max_turn_requests",
         "--autocompress", "--system", "--sessions-dir", "--skills-dir",
         "--memories-dir", "--ctx-size", "--log-level", "--log-full",
         "--read-limit-chars", "--extra-body", "--thinking", "--sandbox",

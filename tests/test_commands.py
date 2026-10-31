@@ -2249,12 +2249,14 @@ def test_repetition_escalates_with_temperature_when_dry_is_unavailable():
 def test_forced_final_turn_yields_an_answer_at_the_ceiling():
     server = FakeServer()
     try:
-        for index in range(A.MAX_TURN_REQUESTS):
+        # the ceiling is per-agent (--max-turn-requests), so build the agent
+        # first and script exactly as many replies as it will allow
+        agent = make_agent(server, yolo=True, messages=["go"])
+        for index in range(agent.max_turn_requests):
             server.push(tool_call_chunk("run_bash",
                                         {"command": f"echo {index}"},
                                         call_id=f"t{index}"))
         server.push(*answer("Established: nothing converged. Remains: pick one."))
-        agent = make_agent(server, yolo=True, messages=["go"])
         with recorded_console(width=140) as output:
             agent.run()
             text = output()
@@ -2266,7 +2268,7 @@ def test_forced_final_turn_yields_an_answer_at_the_ceiling():
         assert not any("maximum number of requests" in str(m.get("content"))
                        for m in agent.conversation)
         # exactly one extra request beyond the ceiling
-        assert server.count == A.MAX_TURN_REQUESTS + 1, server.count
+        assert server.count == agent.max_turn_requests + 1, server.count
         # tools were disabled for it
         assert "tools" not in server.requests[-1]
     finally:

@@ -18,6 +18,21 @@ from harness import (  # noqa: E402
 # file tools: clean, instructive errors (a raw OSError teaches the model
 # nothing and provoked the read_file/edit_file loops seen in the wild)
 # --------------------------------------------------------------------------- #
+def job_log_files() -> list:
+    """Log files written by run_bash/background jobs.
+
+    LOGS_DIR also holds the application's own rolling log (py-ai_*.log),
+    which FileLogFilter writes there on the first WARNING. These tests are
+    about the trace run_bash leaves behind, so the app log is not a job log
+    and must not be counted.
+    """
+    directory = Path(A.LOGS_DIR)
+    if not directory.is_dir():
+        return []
+    return [p for p in directory.glob("*.log")
+            if not p.name.startswith("py-ai_")]
+
+
 def test_read_file_paging_and_errors():
     Path("f.txt").write_text("\n".join(f"line{i}" for i in range(1, 11)))
     assert A.read_file({"path": "f.txt"}).splitlines()[0] == "line1"
@@ -854,7 +869,7 @@ def test_background_run_bash_detaches_and_logs():
     job = A.BACKGROUND_JOBS[-1]
     assert A.job_state(job) == "running"            # returned immediately
     log_path = Path(job["log"])
-    assert log_path.parent.name == A.BG_LOG_DIR
+    assert log_path.parent.name == A.LOGS_DIR
     assert log_path.read_text().startswith("$ sleep 0.2")
 
     for _ in range(30):                             # let it finish
@@ -901,7 +916,7 @@ def test_jobs_command_lists_state_and_logs():
     with recorded_console(width=140) as output:
         agent._handle_command("/jobs")
         text = output()
-    assert "sleep 0.1" in text and A.BG_LOG_DIR in text
+    assert "sleep 0.1" in text and A.LOGS_DIR in text
     assert "running" in text or "exit" in text
     time.sleep(0.5)
     A.BACKGROUND_JOBS.clear()
@@ -928,16 +943,16 @@ def test_background_log_carries_an_exit_trailer():
 
 
 def test_background_logs_are_pruned():
-    Path(A.BG_LOG_DIR).mkdir(parents=True, exist_ok=True)
+    Path(A.LOGS_DIR).mkdir(parents=True, exist_ok=True)
     for index in range(A.BG_LOG_MAX_FILES + 6):
-        Path(A.BG_LOG_DIR, f"old-{index:03d}.log").write_text("x")
-    ancient = Path(A.BG_LOG_DIR, "ancient.log")
+        Path(A.LOGS_DIR, f"old-{index:03d}.log").write_text("x")
+    ancient = Path(A.LOGS_DIR, "ancient.log")
     ancient.write_text("x")
     old_time = time.time() - (A.BG_LOG_MAX_AGE_DAYS + 1) * 86400
     os.utime(ancient, (old_time, old_time))
 
     A.prune_background_logs()
-    remaining = sorted(p.name for p in Path(A.BG_LOG_DIR).glob("*.log"))
+    remaining = sorted(p.name for p in job_log_files())
     assert len(remaining) <= A.BG_LOG_MAX_FILES, len(remaining)
     assert "ancient.log" not in remaining          # aged out
 
@@ -946,7 +961,7 @@ def test_background_logs_are_pruned():
     A.run_bash({"command": "sleep 5", "background": True})
     live = A.BACKGROUND_JOBS[-1]["log"]
     for index in range(A.BG_LOG_MAX_FILES + 6):
-        Path(A.BG_LOG_DIR, f"filler-{index:03d}.log").write_text("x")
+        Path(A.LOGS_DIR, f"filler-{index:03d}.log").write_text("x")
     A.prune_background_logs()
     assert Path(live).exists(), "a running job's log must survive pruning"
     A.BACKGROUND_JOBS.clear()
@@ -961,8 +976,8 @@ def test_fast_commands_keep_the_old_output_contract():
     assert A.run_bash({"command": "exit 3"}) == "[exit 3]\n(no output)"
     assert A.run_bash({"command": "echo oops >&2"}) == "[exit 0]\noops"
     # and it leaves no trace behind
-    assert not list(Path(A.BG_LOG_DIR).glob("*.log")) if \
-        Path(A.BG_LOG_DIR).is_dir() else True
+    assert not list(job_log_files()) if \
+        Path(A.LOGS_DIR).is_dir() else True
     assert A.BACKGROUND_JOBS == []
 
 
@@ -975,7 +990,7 @@ def test_wait_background_returns_the_finished_output():
     result = A.wait_background({"pid": pid})
     assert result == "[exit 4]\nlate-output", result
     assert A.BACKGROUND_JOBS == []          # cleaned up after the wait
-    assert not list(Path(A.BG_LOG_DIR).glob("*.log"))
+    assert not list(job_log_files())
 
 
 def test_wait_background_edge_cases():
