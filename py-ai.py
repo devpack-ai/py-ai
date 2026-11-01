@@ -39,7 +39,10 @@ try:
 except ImportError:
     msvcrt = None
 
-import httpx
+try:
+    import httpx2 as httpx
+except ImportError:
+    import httpx
 
 try:  # only needed for --transport sdk
     import openai
