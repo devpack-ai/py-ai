@@ -10474,8 +10474,8 @@ def main() -> None:
         "--ui",
         choices=["rich", "textual"],
         default="textual",
-        help="Rendering backend: 'rich' (default) prints an inline TUI in "
-        "your terminal with readline input; 'textual' runs the same agent "
+        help="Rendering backend: 'rich' prints an inline TUI in your terminal "
+        "with readline input; 'textual' (default) runs the same agent "
         "inside a full-screen Textual app (scrollable chat log, bottom "
         "input with history and Tab completion; pip install textual).",
     )
@@ -10776,6 +10776,9 @@ def main() -> None:
     if not allow_bash:
         log.info("! shell escape disabled for this session")
 
+    agent.ui_kind = args.ui
+    agent.report_path = args.report
+
     # GUI ?
     if args.ui == "textual":
         initial = []
@@ -10797,8 +10800,6 @@ def main() -> None:
     if args.resume:
         agent._load_session(args.resume)
     agent.tasks = tasks
-    agent.ui_kind = args.ui
-    agent.report_path = args.report
     if args.skill:
         agent._set_skill(args.skill)
     if startup_task:
