@@ -1,0 +1,5 @@
+httpx
+httpx2
+rich
+textual
+openai

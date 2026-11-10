@@ -1,24 +1,42 @@
 # py-ai © devpack
 
 A Python single-file "coding agent-harness" for **any OpenAI-compatible endpoint** —
-built for servers like llama.cpp, vLLM and so on.
+built for servers like llama.cpp, vLLM etc.
 
 Everything lives in `py-ai.py`: two UIs, two tool-calling protocols, two
 transports, a recovery layer, a deterministic security boundary, skills,
 memories, sessions, context compression, and file attachments.
 
 Note: As any powerful tool, use at your own risk, may contain non-human code.
-Recommended usage: local-network or private self-hosted VPN network "Headscale alike" (as we provide no auth/access control).
+Recommended usage: Local-network or private self-hosted VPN network "Headscale alike" (as we provide no auth/access control).
+It is also recommended to use isolated MicroVM environment as detailed here [Micro-VM Sandbox](wiki/microvm-sandbox.md)
 
 Python3 deps (=> uv or pip): httpx rich textual (textual is the default UI), exemple:
 
 ```bash
-python3 py-ai.py # talks to http://127.0.0.1:8080/v1
-python3 py-ai.py --base-url http://192.168.1.39:8080/v1
+git clone https://github.com/devpack-ai/py-ai.git
+cd py-ai
+
+uv python install 3.14
+uv venv ai-env --python 3.14
+source ai-env/bin/activate
+
+(ai-env) uv pip install -r requirements.txt
+
+(ai-env) python3 py-ai.py --base-url=http://172.16.0.1:8080/v1/ --api-key=your_key
 ```
-![1.jpg](https://raw.githubusercontent.com/devpack/py-ai/refs/heads/main/wiki/pics/1.jpg)
-![2.jpg](https://raw.githubusercontent.com/devpack/py-ai/refs/heads/main/wiki/pics/2.jpg)
-![3.jpg](https://raw.githubusercontent.com/devpack/py-ai/refs/heads/main/wiki/pics/3.jpg)
+
+```bash
+python3 py-ai.py # talks to http://127.0.0.1:8080/v1
+
+python3 py-ai.py --base-url=http://192.168.1.39:8080/v1
+python3 py-ai.py --base-url=http://192.168.1.39:8080/v1 --api-key=your_key
+python3 py-ai.py --base-url=http://192.168.1.39:8080/v1 --ui=rich
+python3 py-ai.py --base-url=http://192.168.1.39:8080/v1 --api-key=your_key --ui=textual
+```
+![1.jpg](https://raw.githubusercontent.com/devpack-ai/py-ai/refs/heads/main/wiki/pics/1.jpg)
+![2.jpg](https://raw.githubusercontent.com/devpack-ai/py-ai/refs/heads/main/wiki/pics/2.jpg)
+![3.jpg](https://raw.githubusercontent.com/devpack-ai/py-ai/refs/heads/main/wiki/pics/3.jpg)
 
 ---
 
