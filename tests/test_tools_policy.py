@@ -142,7 +142,10 @@ def test_run_bash_output_contract():
 
 
 def test_search_web_parsing_and_offline_degradation():
-    import httpx
+    try:
+        import httpx2 as httpx
+    except ImportError:
+        import httpx
 
     sample = (
         '<a class="result__a" '
@@ -1094,7 +1097,10 @@ def test_search_files_traversal_skips_and_streams():
 
 
 def test_web_search_retries_transient_failures():
-    import httpx
+    try:
+        import httpx2 as httpx
+    except ImportError:
+        import httpx
 
     sample = ('<a class="result__a" href="https://x.com/p">Title</a>'
               '<a class="result__snippet">snip</a>')
@@ -1139,7 +1145,10 @@ def test_web_search_retries_transient_failures():
 def test_web_search_distinguishes_blocked_from_empty():
     """A bot-check page answers 200 with no results. Reporting that as
     'no results' tells the model the web has nothing on the topic."""
-    import httpx
+    try:
+        import httpx2 as httpx
+    except ImportError:
+        import httpx
 
     class Response:
         def __init__(self, status=200, text=""):

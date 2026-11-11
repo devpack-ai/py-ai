@@ -321,7 +321,7 @@ Run server (or use online provider) on port 8080 (host: 172.16.0.1)
 
 ```bash
 ❯ apt install python3-pip
-❯ python3 -m pip install httpx httpx2 rich textual openai
+❯ python3 -m pip install httpx2 rich textual openai
 ```
 
 #### Install / Run Codex or other

@@ -11,7 +11,7 @@ Note: As any powerful tool, use at your own risk, may contain non-human code.
 Recommended usage: Local-network or private self-hosted VPN network "Headscale alike" (as we provide no auth/access control).
 It is also recommended to use isolated MicroVM environment as detailed here [Micro-VM Sandbox](wiki/microvm-sandbox.md)
 
-Python3 deps (=> uv or pip): httpx rich textual (textual is the default UI), exemple:
+Python3 deps (=> uv or pip): httpx2 rich textual (textual is the default UI), exemple:
 
 ```bash
 git clone https://github.com/devpack-ai/py-ai.git
@@ -1291,7 +1291,7 @@ See `tests/README.md` for layout, conventions and known gaps.
 ## Requirements
 
 - Python 3.10+
-- `httpx`, `rich` — required
+- `httpx` or `httpx2`, `rich` — required
 - `textual` — for the default UI
 - `textual-serve` — for `--serve`
 - `openai` — only for `--transport sdk`
